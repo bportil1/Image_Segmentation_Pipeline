@@ -10,7 +10,7 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import MinMaxScaler
 from numba import cuda, float32, int32
 from multiprocessing import cpu_count, Pool
-import multiprocessing
+
 
 # Initialize warnings
 warnings.filterwarnings("ignore")
@@ -18,7 +18,6 @@ warnings.filterwarnings("ignore")
 class AEW:
     def __init__(self, data, gamma_init=None):
         # DATA HOLDING OBJECTS
-        multiprocessing.set_start_method('spawn')
         self.data = cp.array(data.values)  # Convert data to CuPy array (GPU array)
         self.gamma = self.gamma_initializer(gamma_init)
         self.similarity_matrix = None
@@ -48,9 +47,11 @@ class AEW:
         elif gamma_init == 'random_float':
             return cp.random.random(size=(1, self.data.shape[1]))
 
-    #@cuda.jit(device=True)
-    def similarity_function_kernel(point1, point2, gamma):
+    def similarity_function(self, pt1_idx, pt2_idx, gamma):
         """GPU-optimized function to calculate similarity between two points."""
+        point1 = self.data[pt1_idx]
+        point2 = self.data[pt2_idx]
+
         deg_pt1 = cp.sum(point1)  # Calculate degree
         deg_pt2 = cp.sum(point2)  # Calculate degree
 
@@ -62,24 +63,16 @@ class AEW:
         if degree_normalization_term != 0 and not abs(degree_normalization_term - 0) <= max(1e-09 * max(abs(degree_normalization_term), abs(0)), 0.0):
             result = similarity_measure / degree_normalization_term
         else:
-            result =  0
+            result = 0
 
-    def similarity_function(self, pt1_idx, pt2_idx, gamma):
-        """Wrapper to call GPU kernel function for similarity computation."""
-        result = 0
-        point1 = self.data[pt1_idx]
-        point2 = self.data[pt2_idx]
-        #threads_per_block = 256  # Optimal number of threads per block
-        #blocks_per_grid = (1 + threads_per_block - 1) // threads_per_block
-        #AEW.similarity_function_kernel[blocks_per_grid, threads_per_block](point1, point2, gamma, result)
+        return result
 
-        return AEW.similarity_function_kernel(point1, point2, gamma)
+    def objective_computation(self, section, adj_matrix, gamma):
+        """Compute the objective function (without parallelization)."""
+        print("Computing Error")
+        result = cp.zeros(len(section), dtype=cp.float32)
 
-    @cuda.jit
-    def objective_computation_kernel(section, adj_matrix, gamma, result):
-        """GPU-optimized kernel to compute the objective function."""
-        idx = cuda.grid(1)
-        if idx < len(section):
+        for idx in section:
             degree_idx = cp.sum(adj_matrix[idx].toarray())  # Sparse matrix access
             xi_reconstruction = cp.sum([adj_matrix[idx, y] * self.data[y] for y in range(adj_matrix.shape[1]) if idx != y], 0)
 
@@ -90,21 +83,15 @@ class AEW:
 
             result[idx] = cp.sum((self.data[idx] - xi_reconstruction) ** 2)
 
-    def objective_computation(self, section, adj_matrix, gamma):
-        """Wrapper to call the kernel for the objective computation."""
-        print("Computing Error")
-        result = cp.zeros(len(section), dtype=cp.float32)
-        threads_per_block = 256  # Optimal number of threads per block
-        blocks_per_grid = (len(section) + threads_per_block - 1) // threads_per_block
-        AEW.objective_computation_kernel[blocks_per_grid, threads_per_block](section, adj_matrix, gamma, result)
         print("Error Computation Complete")
         return cp.sum(result)
 
-    @cuda.jit
-    def gradient_computation_kernel(section, similarity_matrix, gamma, result):
-        """GPU-optimized gradient computation."""
-        idx = cuda.grid(1)
-        if idx < len(section):
+    def gradient_computation(self, section, similarity_matrix, gamma):
+        """Compute the gradient function (without parallelization)."""
+        print("Computing Gradient")
+        result = cp.zeros(len(section), dtype=cp.float32)
+
+        for idx in section:
             dii = cp.sum(similarity_matrix[idx].toarray())  # Ensure sparse
             xi_reconstruction = cp.sum([similarity_matrix[idx, y] * self.data[y] for y in range(similarity_matrix.shape[1]) if idx != y], 0)
 
@@ -120,13 +107,6 @@ class AEW:
 
             result[idx] = first_term * (dw_dgamma - dD_dgamma)
 
-    def gradient_computation(self, section, similarity_matrix, gamma):
-        """Wrapper to call the kernel for gradient computation."""
-        print("Computing Gradient")
-        result = cp.zeros(len(section), dtype=cp.float32)
-        threads_per_block = 256  # Optimal number of threads per block
-        blocks_per_grid = (len(section) + threads_per_block - 1) // threads_per_block
-        AEW.gradient_computation_kernel[blocks_per_grid, threads_per_block](section, similarity_matrix, gamma, result)
         print("Gradient Computation Complete")
         return cp.sum(result)
 
@@ -145,7 +125,7 @@ class AEW:
         self.similarity_matrix = self.generate_edge_weights(self.gamma)
 
     def edge_weight_computation(self, section, gamma):
-        """Precompute edge weights for the given section in parallel."""
+        """Compute edge weights for the given section (no parallelization)."""
         print("Computing Edge Weights")
         res = []
         for idx in section:
@@ -153,11 +133,10 @@ class AEW:
                 if vertex != idx:
                     res.append((idx, vertex, self.similarity_function(idx, vertex, gamma)))
         print("Completed Edge Weights Computation")
-
         return res
 
     def optimized_edge_weight_update(self, edge_weight_res, curr_sim_matr):
-        """GPU-optimized sparse matrix update."""
+        """Update the sparse matrix with new edge weights."""
         print("Updating Edge Weights")
         row_indices = []
         col_indices = []
@@ -177,10 +156,7 @@ class AEW:
         # Create a sparse matrix from the collected values
         row_indices = cp.array(row_indices)
         col_indices = cp.array(col_indices)
-        print(values)
-        values = cp.array([values])
-
-        print(values)
+        values = cp.array(values)
 
         # Create a sparse matrix and perform the update on GPU
         new_sim_matr = csr_matrix((values, (row_indices, col_indices)), shape=curr_sim_matr.shape)
@@ -192,13 +168,15 @@ class AEW:
         print("Generating Edge Weights")
         curr_sim_matr = csr_matrix(np.zeros_like(self.similarity_matrix.toarray()))
 
+        # Remove multiprocessing; now iterating sequentially
         split_data = self.split(range(self.data.shape[0]), cpu_count())
-        with Pool(processes=cpu_count()) as pool:
-            edge_weight_res = [pool.apply_async(self.edge_weight_computation, (section, gamma)) for section in split_data]
-            edge_weights = [edge_weight.get() for edge_weight in edge_weight_res]
+
+        edge_weight_res = []
+        for section in split_data:
+            edge_weight_res.append(self.edge_weight_computation(section, gamma))
 
         # Efficiently update the sparse matrix on GPU
-        curr_sim_matr = self.optimized_edge_weight_update(edge_weights, curr_sim_matr)
+        curr_sim_matr = self.optimized_edge_weight_update(edge_weight_res, curr_sim_matr)
         curr_sim_matr = self.subtract_identity(curr_sim_matr)
 
         print("Edge Weight Generation Complete")
@@ -211,7 +189,5 @@ class AEW:
             adj_matrix.setdiag(identity_diag_res)
             return csr_matrix(cp.identity(adj_matrix.shape[0])) - adj_matrix
         else:
-            identity_diag_res = cp.ones(len(adj_matrix)) + 2
-            np.fill_diagonal(adj_matrix, identity_diag_res)
-            return np.identity(len(adj_matrix)) - adj_matrix
+            identity_diag_res = cp.ones(len(adj_matrix))
 

@@ -191,6 +191,7 @@ class SwarmBasedAnnealingOptimizer:
         # Initialize the swarm (random positions and velocities)
         self.positions = np.random.uniform(-100, 100, (self.num_particles, self.dimensions))  # Random initial positions
         self.masses = np.ones((1, self.num_particles))[0] * (1/self.num_particles)
+        self.curr_fitness = np.zeros_like(self.masses)
 
         # Best known positions and their corresponding fitness values
         self.personal_best_positions = np.copy(self.positions)
@@ -215,11 +216,12 @@ class SwarmBasedAnnealingOptimizer:
 
         # Now compute the fitness based on the similarity matrix and current particle position
         fitness = self.error_computation(curr_sim_matr, self.positions[particle_idx])
+        self.curr_fitness[particle_idx] = fitness 
         return fitness
 
     def update_mass(self, particle_idx):
         # Update the mass of each particle based on its fitness
-        fitness = self.compute_error(particle_idx)
+        fitness = self.curr_fitness[particle_idx]
         new_mass = self.masses[particle_idx] - (self.h * (fitness - self.provisional_minimum) * self.masses[particle_idx])
         new_mass = np.clip(new_mass, 1e-6, 1)
         return new_mass
@@ -233,7 +235,7 @@ class SwarmBasedAnnealingOptimizer:
         self.positions = np.clip(self.positions, -1e300, 1e300)
 
         # Update the particle's position based on the gradient and mass
-        new_position = self.positions[particle_idx] - (self.h * gradient * self.compute_error(particle_idx)) + (np.sqrt(2 * self.h * inv_mass) * eta)
+        new_position = self.positions[particle_idx] - (self.h * gradient * self.current_fitness[particle_idx]) + (np.sqrt(2 * self.h * inv_mass) * eta)
         return new_position
 
     def provisional_min_computation(self):
@@ -247,9 +249,12 @@ class SwarmBasedAnnealingOptimizer:
 
         for iteration in range(self.max_iter):
             for i in range(self.num_particles):
-                # Update the mass of each particle
+                print(f"Initial Mass for Agent {i}: {self.masses[i]}")
                 new_mass = self.update_mass(i)
                 self.masses[i] = new_mass
+                print(f"Current Mass for Agent {i}: {new_position}")
+
+
 
             # Update the particle positions using a scaled noise factor (eta)
             h = self.h * np.exp(-.99 * iteration)

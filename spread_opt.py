@@ -99,7 +99,7 @@ class AEW():
         gradient = np.zeros(len(gamma))
         for idx in section:
             dii = np.sum(similarity_matrix[idx])
-            xi_reconstruction = np.sum([similarity_matrix[idx][y]*np.asarray(self.data.loc[[y]])[0] for y in range(len(similarity_matrix[idx])) if idx != y], 0)
+            xi_reconstruction = np.sum([similarity_matrix[idx, y]*np.asarray(self.data.loc[[y]])[0] for y in range(len(similarity_matrix[idx])) if idx != y], 0)
             if dii != 0 and not isclose(dii, 0, abs_tol=1e-100):
                 xi_reconstruction = np.divide(xi_reconstruction, dii, casting='unsafe', dtype=np.longdouble)
                 first_term = np.divide((np.asarray(self.data.loc[[idx]])[0] - xi_reconstruction), dii, casting='unsafe', dtype=np.longdouble)
@@ -107,8 +107,8 @@ class AEW():
                 first_term  = np.zeros_like(xi_reconstruction)
                 xi_reconstruction  = np.zeros_like(xi_reconstruction)
             cubed_gamma = np.where( np.abs(gamma) > .1e-7 ,  gamma**(-3), 0)
-            dw_dgamma = np.sum([(2*similarity_matrix[idx][y]* (((np.asarray(self.data.loc[[idx]])[0] - np.asarray(self.data.loc[[y]])[0])**2)*cubed_gamma)*np.asarray(self.data.loc[[y]])[0]) for y in range(self.data.shape[0]) if idx != y])
-            dD_dgamma = np.sum([(2*similarity_matrix[idx][y]* (((np.asarray(self.data.loc[[idx]])[0] - np.asarray(self.data.loc[[y]])[0])**2)*cubed_gamma)*xi_reconstruction) for y in range(self.data.shape[0]) if idx != y])
+            dw_dgamma = np.sum([(2*similarity_matrix[idx, y]* (((np.asarray(self.data.loc[[idx]])[0] - np.asarray(self.data.loc[[y]])[0])**2)*cubed_gamma)*np.asarray(self.data.loc[[y]])[0]) for y in range(self.data.shape[0]) if idx != y])
+            dD_dgamma = np.sum([(2*similarity_matrix[idx, y]* (((np.asarray(self.data.loc[[idx]])[0] - np.asarray(self.data.loc[[y]])[0])**2)*cubed_gamma)*xi_reconstruction) for y in range(self.data.shape[0]) if idx != y])
 
             gradient = gradient + (first_term * (dw_dgamma - dD_dgamma))
             

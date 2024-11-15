@@ -1,4 +1,4 @@
-from aew import *
+from aew_gpu_2 import *
 from label_propagation import *
 
 import pandas as pd
