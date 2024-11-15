@@ -1,14 +1,14 @@
 import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix
-from multiprocessing import Pool, cpu_count
+from sklearn.neighbors import kneighbors_graph
+from optimizers import *
+import warnings
 from math import isclose
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.neighbors import kneighbors_graph
-import warnings
-from optimizers import *
-
+from multiprocessing import cpu_count, Pool
+# Initialize warnings
 warnings.filterwarnings("ignore")
 
 class AEW:
@@ -19,16 +19,15 @@ class AEW:
         self.similarity_matrix = None
 
     def generate_graphs(self, num_neighbors, mode='distance', metric='euclidean'):
-        # Generate a sparse k-neighbors graph directly without converting to dense matrix
+        # Generate a sparse k-neighbors graph
         graph = kneighbors_graph(self.data, n_neighbors=num_neighbors, mode=mode, metric=metric, p=2, include_self=True, n_jobs=-1)
         self.similarity_matrix = self.correct_similarity_matrix_diag(graph)
 
     def correct_similarity_matrix_diag(self, similarity_matrix):
-        # Correct diagonal for similarity matrix
+        # Convert to sparse matrix and adjust diagonal
         if not isinstance(similarity_matrix, csr_matrix):
             similarity_matrix = csr_matrix(similarity_matrix)
         
-        # Adjust diagonal values
         identity_diag_res = np.ones(similarity_matrix.shape[0]) + 1  # Diagonal correction value
         similarity_matrix.setdiag(identity_diag_res)  # Set the diagonal directly for sparse matrix
         return similarity_matrix
@@ -38,12 +37,11 @@ class AEW:
         if gamma_init is None:
             return np.ones(self.data.shape[1])  # Default to ones if not provided
         elif gamma_init == 'var':
-            return np.var(self.data, axis=0).values  # Variance-based initialization
+            return np.var(self.data, axis=0)  # Variance-based initialization
         elif gamma_init == 'random_int':
             return np.random.randint(0, 1000, (1, self.data.shape[1]))
         elif gamma_init == 'random_float':
-            rng = np.random.default_rng()
-            return rng.random(size=(1, self.data.shape[1]))
+            return np.random.random(size=(1, self.data.shape[1]))
 
     def similarity_function(self, pt1_idx, pt2_idx, gamma):
         point1 = np.asarray(self.data.loc[[pt1_idx]])[0]
@@ -67,9 +65,9 @@ class AEW:
         error_sum = 0
 
         for idx in section:
-            degree_idx = np.sum(adj_matrix[idx].toarray())
-            xi_reconstruction = np.sum([adj_matrix[idx][y] * np.asarray(self.data.loc[[y]])[0] for y in range(len(adj_matrix[idx])) if idx != y], 0)
-
+            degree_idx = np.sum(adj_matrix[idx].toarray())  # Ensure using sparse
+            xi_reconstruction = np.sum([adj_matrix[idx, y] * np.asarray(self.data.loc[[y]])[0]
+                                    for y in range(adj_matrix[idx].shape[1]) if idx != y], 0)
             if degree_idx != 0 and not isclose(degree_idx, 0, abs_tol=1e-100):
                 xi_reconstruction /= degree_idx
             else:
@@ -83,15 +81,17 @@ class AEW:
         split_data = self.split(range(self.data.shape[0]), cpu_count())
         with Pool(processes=cpu_count()) as pool:
             errors = [pool.apply_async(self.objective_computation, (section, adj_matr, gamma)) for section in split_data]
-            error = np.sum([error.get() for error in errors])
+            error = np.sum([error.get() for error in errors])  # Ensure using np.sum
         return error
 
     def gradient_computation(self, section, similarity_matrix, gamma):
         gradient = np.zeros(len(gamma))
 
         for idx in section:
-            dii = np.sum(similarity_matrix[idx].toarray())
-            xi_reconstruction = np.sum([similarity_matrix[idx][y] * np.asarray(self.data.loc[[y]])[0] for y in range(len(similarity_matrix[idx])) if idx != y], 0)
+            dii = np.sum(similarity_matrix[idx].toarray())  # Ensure sparse
+            xi_reconstruction = np.sum([similarity_matrix[idx, y] * np.asarray(self.data.loc[[y]])[0] 
+                            for y in range(similarity_matrix.shape[1]) if idx != y], 0)
+
             if dii != 0 and not isclose(dii, 0, abs_tol=1e-100):
                 xi_reconstruction = xi_reconstruction / dii
                 first_term = (np.asarray(self.data.loc[[idx]])[0] - xi_reconstruction) / dii
@@ -125,7 +125,7 @@ class AEW:
         print("Generating Optimal Edge Weights")
         self.similarity_matrix = self.generate_edge_weights(self.gamma)
 
-        sba = SwarmBasedAnnealingOptimizer(self.similarity_matrix, self.generate_edge_weights, self.objective_function, self.gradient_function, self.gamma, 1, len(self.gamma), 1)
+        sba = SwarmBasedAnnealingOptimizer(self.similarity_matrix, self.generate_edge_weights, self.objective_function, self.gradient_function, self.gamma, 5, len(self.gamma), 10)
         self.gamma, _, _, _ = sba.optimize()
 
         self.similarity_matrix = self.generate_edge_weights(self.gamma)
