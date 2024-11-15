@@ -20,7 +20,7 @@ class AEW:
 
     def generate_graphs(self, num_neighbors, mode='distance', metric='euclidean'):
         # Generate a sparse k-neighbors graph
-        graph = kneighbors_graph(self.data, n_neighbors=num_neighbors, mode=mode, metric=metric, p=2, include_self=True, n_jobs=-1)
+        graph = kneighbors_graph(self.data, n_neighbors=num_neighbors, mode=mode, metric=metric, p=2, include_self=False, n_jobs=-1)
         self.similarity_matrix = self.correct_similarity_matrix_diag(graph)
 
     def correct_similarity_matrix_diag(self, similarity_matrix):
@@ -99,6 +99,10 @@ class AEW:
                 first_term = np.zeros_like(xi_reconstruction)
 
             cubed_gamma = np.where(np.abs(gamma) > 1e-7, gamma ** (-3), 0)
+            print(similarity_matrix[idx][0])
+            print(np.asarray(self.data.loc[[idx]])[0] )
+            print(self.data.shape[0])
+            print(np.asarray(self.data.loc[[0]])[0])
             dw_dgamma = np.sum([2 * similarity_matrix[idx][y] * (((np.asarray(self.data.loc[[idx]])[0] - np.asarray(self.data.loc[[y]])[0]) ** 2) * cubed_gamma) * np.asarray(self.data.loc[[y]])[0] for y in range(self.data.shape[0]) if idx != y])
             dD_dgamma = np.sum([2 * similarity_matrix[idx][y] * (((np.asarray(self.data.loc[[idx]])[0] - np.asarray(self.data.loc[[y]])[0]) ** 2) * cubed_gamma) * xi_reconstruction for y in range(self.data.shape[0]) if idx != y])
 
@@ -125,7 +129,7 @@ class AEW:
         print("Generating Optimal Edge Weights")
         self.similarity_matrix = self.generate_edge_weights(self.gamma)
 
-        sba = SwarmBasedAnnealingOptimizer(self.similarity_matrix, self.generate_edge_weights, self.objective_function, self.gradient_function, self.gamma, 5, len(self.gamma), 10)
+        sba = SwarmBasedAnnealingOptimizer(self.similarity_matrix, self.generate_edge_weights, self.objective_function, self.gradient_function, self.gamma, 1, len(self.gamma), 1)
         self.gamma, _, _, _ = sba.optimize()
 
         self.similarity_matrix = self.generate_edge_weights(self.gamma)
