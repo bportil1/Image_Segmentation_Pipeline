@@ -7,6 +7,8 @@ import cv2
 from scipy.spatial.distance import cdist
 from sklearn.cluster import KMeans
 
+from scipy.sparse import issparse
+
 def compute_adjacency_matrix(image, sigma=1.0):
     """
     Computes an adjacency matrix for an image based on pixel similarities (color).
@@ -27,6 +29,9 @@ def compute_adjacency_matrix(image, sigma=1.0):
     aew_obj.generate_graphs(150)
 
     aew_obj.generate_optimal_edge_weights()
+
+    if issparse(aew_obj.similarity_matrix):
+        aew_obj.similarity_matrix = aew_obj.similarity_matrix.toarray()
 
     return aew_obj.similarity_matrix
 

@@ -125,7 +125,7 @@ class AEW:
         print("Generating Optimal Edge Weights")
         self.similarity_matrix = self.generate_edge_weights(self.gamma)
 
-        sba = SwarmBasedAnnealingOptimizer(self.similarity_matrix, self.generate_edge_weights, self.objective_function, self.gradient_function, self.gamma, 1, len(self.gamma), 3)
+        sba = SwarmBasedAnnealingOptimizer(self.similarity_matrix, self.generate_edge_weights, self.objective_function, self.gradient_function, self.gamma, 1, len(self.gamma), 1)
         self.gamma, _, _, _ = sba.optimize()
 
         self.similarity_matrix = self.generate_edge_weights(self.gamma)
@@ -140,6 +140,36 @@ class AEW:
 
         return res
 
+    def optimized_edge_weight_update(self, edge_weight_res, curr_sim_matr):
+        # Prepare lists for row indices, column indices, and corresponding values
+        row_indices = []
+        col_indices = []
+        values = []
+
+        for section in edge_weight_res:
+            for weight in section:
+                idx1, idx2, w = weight
+                if idx1 != idx2:  # Avoid self-loops early
+                    row_indices.append(idx1)
+                    col_indices.append(idx2)
+                    values.append(w)
+                    row_indices.append(idx2)
+                    col_indices.append(idx1)
+                    values.append(w)
+
+        # Convert lists to numpy arrays for sparse matrix creation
+        row_indices = np.array(row_indices)
+        col_indices = np.array(col_indices)
+        values = np.array(values)
+
+        # Create a sparse matrix from the collected values
+        new_sim_matr = csr_matrix((values, (row_indices, col_indices)), shape=curr_sim_matr.shape)
+
+        # Add the newly computed values to the current similarity matrix
+        curr_sim_matr += new_sim_matr
+
+        return curr_sim_matr
+
     def generate_edge_weights(self, gamma):
         print("Generating Edge Weights")
         curr_sim_matr = csr_matrix(np.zeros_like(self.similarity_matrix.toarray()))
@@ -149,11 +179,8 @@ class AEW:
             edge_weight_res = [pool.apply_async(self.edge_weight_computation, (section, gamma)) for section in split_data]
             edge_weights = [edge_weight.get() for edge_weight in edge_weight_res]
 
-        for section in edge_weights:
-            for weight in section:
-                if weight[0] != weight[1]:
-                    curr_sim_matr[weight[0], weight[1]] = weight[2]
-                    curr_sim_matr[weight[1], weight[0]] = weight[2]
+        # Efficiently update the sparse matrix
+        curr_sim_matr = self.optimized_edge_weight_update(edge_weights, curr_sim_matr)
 
         curr_sim_matr = self.subtract_identity(curr_sim_matr)
 
