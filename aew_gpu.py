@@ -1,13 +1,13 @@
 import numpy as np
 import pandas as pd
-from scipy.sparse import csr_matrix
-from multiprocessing import Pool, cpu_count
-from math import isclose
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.neighbors import kneighbors_graph
+import cupy as cp
+from cuml.neighbors import NearestNeighbors as cuNearestNeighbors
+from cuml.sparse import csr_matrix as cu_csr_matrix
+from cuml.decomposition import PCA as cuPCA
 import warnings
 from optimizers import *
+from math import isclose
+from multiprocessing import Pool, cpu_count
 
 warnings.filterwarnings("ignore")
 
@@ -19,44 +19,45 @@ class AEW:
         self.similarity_matrix = None
 
     def generate_graphs(self, num_neighbors, mode='distance', metric='euclidean'):
-        # Generate a sparse k-neighbors graph directly without converting to dense matrix
-        graph = kneighbors_graph(self.data, n_neighbors=num_neighbors, mode=mode, metric=metric, p=2, include_self=True, n_jobs=-1)
+        # Generate a sparse k-neighbors graph directly using cuML (GPU)
+        cu_data = cp.asarray(self.data.to_numpy())  # Move data to GPU
+        knn = cuNearestNeighbors(n_neighbors=num_neighbors, metric=metric)
+        knn.fit(cu_data)
+        graph = knn.kneighbors_graph(cu_data, mode=mode)  # Generate the k-NN graph
         self.similarity_matrix = self.correct_similarity_matrix_diag(graph)
 
     def correct_similarity_matrix_diag(self, similarity_matrix):
-        # Correct diagonal for similarity matrix
-        if not isinstance(similarity_matrix, csr_matrix):
-            similarity_matrix = csr_matrix(similarity_matrix)
+        # Correct diagonal for similarity matrix on GPU (CuPy array)
+        if not isinstance(similarity_matrix, cu_csr_matrix):
+            similarity_matrix = cu_csr_matrix(similarity_matrix)
         
-        # Adjust diagonal values
-        identity_diag_res = np.ones(similarity_matrix.shape[0]) + 1  # Diagonal correction value
+        identity_diag_res = cp.ones(similarity_matrix.shape[0]) + 1  # Diagonal correction value
         similarity_matrix.setdiag(identity_diag_res)  # Set the diagonal directly for sparse matrix
         return similarity_matrix
 
     def gamma_initializer(self, gamma_init=None):
         # Initialize gamma based on the provided method
         if gamma_init is None:
-            return np.ones(self.data.shape[1])  # Default to ones if not provided
+            return cp.ones(self.data.shape[1])  # Default to ones if not provided
         elif gamma_init == 'var':
-            return np.var(self.data, axis=0).values  # Variance-based initialization
+            return cp.var(cp.asarray(self.data), axis=0)  # Variance-based initialization
         elif gamma_init == 'random_int':
-            return np.random.randint(0, 1000, (1, self.data.shape[1]))
+            return cp.random.randint(0, 1000, (1, self.data.shape[1]))
         elif gamma_init == 'random_float':
-            rng = np.random.default_rng()
-            return rng.random(size=(1, self.data.shape[1]))
+            return cp.random.random(size=(1, self.data.shape[1]))
 
     def similarity_function(self, pt1_idx, pt2_idx, gamma):
-        point1 = np.asarray(self.data.loc[[pt1_idx]])[0]
-        point2 = np.asarray(self.data.loc[[pt2_idx]])[0]
+        point1 = cp.asarray(self.data.loc[[pt1_idx]]).get()  # Move data to GPU
+        point2 = cp.asarray(self.data.loc[[pt2_idx]]).get()
 
-        deg_pt1 = np.sum(self.similarity_matrix[pt1_idx].toarray())  # Sparse matrix access
-        deg_pt2 = np.sum(self.similarity_matrix[pt2_idx].toarray())
+        deg_pt1 = cp.sum(self.similarity_matrix[pt1_idx].toarray())  # Sparse matrix access on GPU
+        deg_pt2 = cp.sum(self.similarity_matrix[pt2_idx].toarray())
 
         # Gaussian Kernel with similarity measure
-        similarity_measure = np.sum(np.where(np.abs(gamma) > 1e-5, (((point1 - point2) ** 2) / (gamma ** 2)), 0))
-        similarity_measure = np.exp(-similarity_measure, dtype=np.float64)  # Use float64 to reduce precision cost
+        similarity_measure = cp.sum(cp.where(cp.abs(gamma) > 1e-5, (((point1 - point2) ** 2) / (gamma ** 2)), 0))
+        similarity_measure = cp.exp(-similarity_measure)  # Use CuPy's exp function for GPU
 
-        degree_normalization_term = np.sqrt(np.abs(deg_pt1 * deg_pt2))
+        degree_normalization_term = cp.sqrt(cp.abs(deg_pt1 * deg_pt2))
 
         if degree_normalization_term != 0 and not isclose(degree_normalization_term, 0, abs_tol=1e-100):
             return similarity_measure / degree_normalization_term
@@ -67,15 +68,15 @@ class AEW:
         error_sum = 0
 
         for idx in section:
-            degree_idx = np.sum(adj_matrix[idx].toarray())
-            xi_reconstruction = np.sum([adj_matrix[idx][y] * np.asarray(self.data.loc[[y]])[0] for y in range(len(adj_matrix[idx])) if idx != y], 0)
+            degree_idx = cp.sum(adj_matrix[idx].toarray())  # Move to GPU
+            xi_reconstruction = cp.sum([adj_matrix[idx][y] * cp.asarray(self.data.loc[[y]]).get() for y in range(len(adj_matrix[idx])) if idx != y], 0)
 
             if degree_idx != 0 and not isclose(degree_idx, 0, abs_tol=1e-100):
                 xi_reconstruction /= degree_idx
             else:
-                xi_reconstruction = np.zeros(len(self.gamma))
+                xi_reconstruction = cp.zeros(len(self.gamma))
 
-            error_sum += np.sum((np.asarray(self.data.loc[[idx]])[0] - xi_reconstruction) ** 2)
+            error_sum += cp.sum((cp.asarray(self.data.loc[[idx]]).get() - xi_reconstruction) ** 2)
 
         return error_sum
 
@@ -83,24 +84,24 @@ class AEW:
         split_data = self.split(range(self.data.shape[0]), cpu_count())
         with Pool(processes=cpu_count()) as pool:
             errors = [pool.apply_async(self.objective_computation, (section, adj_matr, gamma)) for section in split_data]
-            error = np.sum([error.get() for error in errors])
+            error = cp.sum([error.get() for error in errors])
         return error
 
     def gradient_computation(self, section, similarity_matrix, gamma):
-        gradient = np.zeros(len(gamma))
+        gradient = cp.zeros(len(gamma))
 
         for idx in section:
-            dii = np.sum(similarity_matrix[idx].toarray())
-            xi_reconstruction = np.sum([similarity_matrix[idx][y] * np.asarray(self.data.loc[[y]])[0] for y in range(len(similarity_matrix[idx])) if idx != y], 0)
+            dii = cp.sum(similarity_matrix[idx].toarray())
+            xi_reconstruction = cp.sum([similarity_matrix[idx][y] * cp.asarray(self.data.loc[[y]]).get() for y in range(len(similarity_matrix[idx])) if idx != y], 0)
             if dii != 0 and not isclose(dii, 0, abs_tol=1e-100):
                 xi_reconstruction = xi_reconstruction / dii
-                first_term = (np.asarray(self.data.loc[[idx]])[0] - xi_reconstruction) / dii
+                first_term = (cp.asarray(self.data.loc[[idx]]).get() - xi_reconstruction) / dii
             else:
-                first_term = np.zeros_like(xi_reconstruction)
+                first_term = cp.zeros_like(xi_reconstruction)
 
-            cubed_gamma = np.where(np.abs(gamma) > 1e-7, gamma ** (-3), 0)
-            dw_dgamma = np.sum([2 * similarity_matrix[idx][y] * (((np.asarray(self.data.loc[[idx]])[0] - np.asarray(self.data.loc[[y]])[0]) ** 2) * cubed_gamma) * np.asarray(self.data.loc[[y]])[0] for y in range(self.data.shape[0]) if idx != y])
-            dD_dgamma = np.sum([2 * similarity_matrix[idx][y] * (((np.asarray(self.data.loc[[idx]])[0] - np.asarray(self.data.loc[[y]])[0]) ** 2) * cubed_gamma) * xi_reconstruction for y in range(self.data.shape[0]) if idx != y])
+            cubed_gamma = cp.where(cp.abs(gamma) > 1e-7, gamma ** (-3), 0)
+            dw_dgamma = cp.sum([2 * similarity_matrix[idx][y] * (((cp.asarray(self.data.loc[[idx]]).get() - cp.asarray(self.data.loc[[y]]).get()) ** 2) * cubed_gamma) * cp.asarray(self.data.loc[[y]]).get() for y in range(self.data.shape[0]) if idx != y])
+            dD_dgamma = cp.sum([2 * similarity_matrix[idx][y] * (((cp.asarray(self.data.loc[[idx]]).get() - cp.asarray(self.data.loc[[y]]).get()) ** 2) * cubed_gamma) * xi_reconstruction for y in range(self.data.shape[0]) if idx != y])
 
             gradient += first_term * (dw_dgamma - dD_dgamma)
 
@@ -119,7 +120,7 @@ class AEW:
             gradients = [pool.apply_async(self.gradient_computation, (section, similarity_matrix, gamma)) for section in split_data]
             gradients = [gradient.get() for gradient in gradients]
 
-        return np.sum(gradients, axis=0)
+        return cp.sum(gradients, axis=0)
 
     def generate_optimal_edge_weights(self):
         print("Generating Optimal Edge Weights")
@@ -142,7 +143,7 @@ class AEW:
 
     def generate_edge_weights(self, gamma):
         print("Generating Edge Weights")
-        curr_sim_matr = csr_matrix(np.zeros_like(self.similarity_matrix.toarray()))
+        curr_sim_matr = cu_csr_matrix(cp.zeros_like(self.similarity_matrix.toarray()))  # Use CuPy for GPU
 
         split_data = self.split(range(self.data.shape[0]), cpu_count())
         with Pool(processes=cpu_count()) as pool:
@@ -162,12 +163,12 @@ class AEW:
 
     def subtract_identity(self, adj_matrix):
         # Subtract identity matrix from the adjacency matrix (sparse matrix)
-        if isinstance(adj_matrix, csr_matrix):
-            identity_diag_res = np.ones(adj_matrix.shape[0]) + 2  # Adjust for identity subtraction
+        if isinstance(adj_matrix, cu_csr_matrix):
+            identity_diag_res = cp.ones(adj_matrix.shape[0]) + 2  # Adjust for identity subtraction
             adj_matrix.setdiag(identity_diag_res)  # Efficient way to set the diagonal for sparse matrix
-            return csr_matrix(np.identity(adj_matrix.shape[0])) - adj_matrix
+            return cu_csr_matrix(cp.identity(adj_matrix.shape[0])) - adj_matrix
         else:
-            identity_diag_res = np.ones(len(adj_matrix)) + 2  # Adjust for identity subtraction
-            np.fill_diagonal(adj_matrix, identity_diag_res)
-            return np.identity(len(adj_matrix)) - adj_matrix
+            identity_diag_res = cp.ones(len(adj_matrix)) + 2  # Adjust for identity subtraction
+            cp.fill_diagonal(adj_matrix, identity_diag_res)
+            return cp.identity(len(adj_matrix)) - adj_matrix
 

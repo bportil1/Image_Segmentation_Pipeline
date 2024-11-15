@@ -11,22 +11,25 @@ from sklearn.decomposition import PCA
 
 from sklearn.preprocessing import MinMaxScaler
 
+from sklearn.neighbors import kneighbors_graph
+
 import warnings
 
 from optimizers import *
 
 warnings.filterwarnings("ignore")
 
-class aew():
-    def __init__(self, similarity_matrix, data, labels, gamma_init=None):
+class AEW():
+    def __init__(self, data, gamma_init=None):
 
         #### DATA HOLDING OBJECTS
         self.data = data
-        self.labels = labels
-        self.eigenvectors = None
         self.gamma = self.gamma_initializer(gamma_init)
-        self.similarity_matrix = self.correct_similarity_matrix_diag(similarity_matrix)
-        self.final_error = 0
+        self.similarity_matrix = None
+
+    def generate_graphs(self, num_neighbors, mode='distance', metric='euclidean'):
+        graph = kneighbors_graph(self.data, n_neighbors=num_neighbors, mode=mode, metric=metric, p=2, include_self=True, n_jobs=-1)
+        self.similarity_matrix = self.correct_similarity_matrix_diag(graph.toarray())
 
     def correct_similarity_matrix_diag(self, similarity_matrix):
         identity = np.zeros((self.data.shape[0], self.data.shape[0]))
@@ -59,8 +62,6 @@ class aew():
         #####  Gaussian Kernel
         similarity_measure = np.sum(np.where(np.abs(gamma) > .1e-5, (((point1 - point2)**2)/(gamma**2)), 0))
 
-        ##### Exponential Kernel
-        #similarity_measure = np.sum(np.where(point1 - point2  > 0, ((np.sqrt((point1 - point2)**2))*self.gamma), 0))
         similarity_measure = np.exp(-similarity_measure, dtype=np.longdouble)
 
         degree_normalization_term = np.sqrt(np.abs(deg_pt1 * deg_pt2))
@@ -109,13 +110,6 @@ class aew():
             dw_dgamma = np.sum([(2*similarity_matrix[idx][y]* (((np.asarray(self.data.loc[[idx]])[0] - np.asarray(self.data.loc[[y]])[0])**2)*cubed_gamma)*np.asarray(self.data.loc[[y]])[0]) for y in range(self.data.shape[0]) if idx != y])
             dD_dgamma = np.sum([(2*similarity_matrix[idx][y]* (((np.asarray(self.data.loc[[idx]])[0] - np.asarray(self.data.loc[[y]])[0])**2)*cubed_gamma)*xi_reconstruction) for y in range(self.data.shape[0]) if idx != y])
 
-
-            ##### Exponential kernel derivative
-            #dw_dgamma = np.sum([(2*self.similarity_matrix[idx][y]* (((np.asarray(self.data.loc[[idx]])[0] - np.asarray(self.data.loc[[y]])[0])**2))*np.asarray(self.data.loc[[y]])[0]) for y in range(self.data.shape[0]) if idx != y])
-            #dD_dgamma = np.sum([(2*self.similarity_matrix[idx][y]* (((np.asarray(self.data.loc[[idx]])[0] - np.asarray(self.data.loc[[y]])[0])**2))*xi_reconstruction) for y in range(self.data.shape[0]) if idx != y])
-
-
-            #print(gradient, " ", first_term, " ", dw_dgamma, " ", dD_dgamma)
             gradient = gradient + (first_term * (dw_dgamma - dD_dgamma))
             
             gradient = np.nan_to_num(gradient, nan=0)
@@ -138,24 +132,14 @@ class aew():
 
         return np.sum(gradients, axis=0)
 
-    def generate_optimal_edge_weights(self, num_iterations):
+    def generate_optimal_edge_weights(self):
         print("Generating Optimal Edge Weights")
-
-        #self.gradient_descent(.000002, num_iterations, .01)
-
-        #self.adam_computation(num_iterations)
 
         self.similarity_matrix = self.generate_edge_weights(self.gamma)
 
-        #self.simulated_annealing(num_iterations)
+        sba = SwarmBasedAnnealingOptimizer(self.similarity_matrix, self.generate_edge_weights, self.objective_function, self.gradient_function, self.gamma, 1, len(self.gamma), 3)
 
-        #pso = ParticleSwarmOptimizer(self.similarity_matrix, self.gamma, self.objective_function, self.generate_edge_weights, 30, len(self.gamma), 10)
-
-        #self.gamma = pso.optimize()
-
-        sba = SwarmBasedAnnealingOptimizer(self.similarity_matrix, self.gamma, self.objective_function, self.gradient_function, self.generate_edge_weights, 30, len(self.gamma), 10)
-
-        self.gamma = sba.optimize()
+        self.gamma, _, _, _ = sba.optimize()
 
         self.similarity_matrix = self.generate_edge_weights(self.gamma)
     
@@ -192,8 +176,6 @@ class aew():
 
         curr_sim_matr = self.subtract_identity(curr_sim_matr)
 
-        #self.remove_disconnections()
-
         print("Edge Weight Generation Complete")
 
         return curr_sim_matr
@@ -205,35 +187,3 @@ class aew():
         np.fill_diagonal(identity, identity_diag_res) 
         adj_matrix = identity - adj_matrix
         return adj_matrix
-
-    def remove_disconnections(self):
-        empty_rows = np.all(self.similarity_matrix == 0, axis = 1)
-        empty_cols = np.all(self.similarity_matrix == 0, axis = 0)
-        self.similarity_matrix = self.similarity_matrix[~empty_rows, :][:, ~empty_cols]
-        self.labels = self.labels.loc[~empty_rows]
-
-    def unit_normalization(self, matrix):
-        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-        return matrix/norms
-
-    def get_eigenvectors(self, num_components, min_variance):
-        pca = PCA()
-
-        if num_components == 'lowest_var':
-
-            pca.fit(self.similarity_matrix)
-
-            expl_var = pca.explained_variance_ratio_
-    
-            print("Variance Distribution First Five: ", expl_var)
-
-            cum_variance = expl_var.cumsum()
-
-            num_components = ( cum_variance <= min_variance).sum() + 1
-
-        pca = PCA(n_components=num_components)
-
-        pca = pca.fit_transform(self.similarity_matrix)
-
-        self.eigenvectors = self.unit_normalization(pca.real)
-
