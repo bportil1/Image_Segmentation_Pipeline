@@ -94,7 +94,7 @@ class AEW:
         """Wrapper to call the kernel for the objective computation."""
         print("Computing Error")
         result = cp.zeros(len(section), dtype=cp.float32)
-        threads_per_block = 256  # Optimal number of threads per block
+        threads_per_block = 32  # Optimal number of threads per block
         blocks_per_grid = (len(section) + threads_per_block - 1) // threads_per_block
         AEW.objective_computation_kernel[blocks_per_grid, threads_per_block](section, adj_matrix, gamma, result)
         print("Error Computation Complete")

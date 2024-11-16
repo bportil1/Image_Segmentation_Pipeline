@@ -1,3 +1,5 @@
+from multiprocessing import cpu_count, Pool
+
 import numpy as np
 import pandas as pd
 import cupy as cp
@@ -9,11 +11,13 @@ from math import isclose
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import MinMaxScaler
 from numba import cuda, float32, int32
-from multiprocessing import cpu_count, Pool
-
 
 # Initialize warnings
 warnings.filterwarnings("ignore")
+
+import multiprocessing
+
+multiprocessing.set_start_method('spawn')
 
 class AEW:
     def __init__(self, data, gamma_init=None):
@@ -67,27 +71,62 @@ class AEW:
 
         return result
 
-    def objective_computation(self, section, adj_matrix, gamma):
-        """Compute the objective function (without parallelization)."""
-        print("Computing Error")
-        result = cp.zeros(len(section), dtype=cp.float32)
+    def edge_weight_computation(self, section, gamma):
+        """Compute edge weights for the given section using GPU-based matrix operations."""
+        print("Computing Edge Weights")
 
-        for idx in section:
-            degree_idx = cp.sum(adj_matrix[idx].toarray())  # Sparse matrix access
-            xi_reconstruction = cp.sum([adj_matrix[idx, y] * self.data[y] for y in range(adj_matrix.shape[1]) if idx != y], 0)
+        # Create a matrix of pairwise differences between all points in section and all other points
+        points = self.data[section]
+        diffs = cp.expand_dims(points, axis=1) - cp.expand_dims(self.data, axis=0)  # Shape: (len(section), num_points, features)
+        
+        # Calculate squared differences, normalize by gamma, and compute similarity
+        squared_diffs = (diffs ** 2) / (gamma ** 2)
+        similarity_matrix = cp.exp(-cp.sum(squared_diffs, axis=2))  # Sum over features and apply exp
 
-            if degree_idx != 0 and not isclose(degree_idx, 0, abs_tol=1e-100):
-                xi_reconstruction /= degree_idx
-            else:
-                xi_reconstruction = cp.zeros(len(gamma))
+        # Normalize by degree terms to compute edge weights
+        degrees = cp.sum(similarity_matrix, axis=1)
 
-            result[idx] = cp.sum((self.data[idx] - xi_reconstruction) ** 2)
+        # To handle division by zero, use cp.nan_to_num to replace any NaN or Inf values that result from division by zero
+        normalized_similarity = similarity_matrix / cp.expand_dims(degrees, axis=1)
 
-        print("Error Computation Complete")
-        return cp.sum(result)
+        # Replace NaN or Inf values that may have been introduced by division by zero with zero
+        normalized_similarity = cp.nan_to_num(normalized_similarity, nan=0.0, posinf=0.0, neginf=0.0)
+
+        print("Completed Edge Weights Computation")
+        return normalized_similarity
+
+    def optimized_edge_weight_update(self, edge_weight_res, curr_sim_matr):
+        """Parallelize the collection of edge weights and update the sparse matrix on GPU."""
+        print("Updating Edge Weights")
+
+        # Parallelize the collection of non-zero entries
+        with Pool(processes=cpu_count()) as pool:
+            results = pool.map(collect_non_zero_entries, edge_weight_res)
+
+        # Flatten results
+        row_indices = []
+        col_indices = []
+        values = []
+
+        for r, c, v in results:
+            row_indices.extend(r)
+            col_indices.extend(c)
+            values.extend(v)
+
+        # Create a sparse matrix and perform the update on GPU
+        row_indices = cp.array(row_indices)
+        col_indices = cp.array(col_indices)
+        values = cp.array(values)
+
+        # Efficient update to the current similarity matrix
+        new_sim_matr = csr_matrix((values, (row_indices, col_indices)), shape=curr_sim_matr.shape)
+        curr_sim_matr += new_sim_matr
+
+        print("Edge Weights Updated")
+        return curr_sim_matr
 
     def gradient_computation(self, section, similarity_matrix, gamma):
-        """Compute the gradient function (without parallelization)."""
+        """Compute the gradient function using GPU-based operations."""
         print("Computing Gradient")
         result = cp.zeros(len(section), dtype=cp.float32)
 
@@ -124,51 +163,11 @@ class AEW:
 
         self.similarity_matrix = self.generate_edge_weights(self.gamma)
 
-    def edge_weight_computation(self, section, gamma):
-        """Compute edge weights for the given section (no parallelization)."""
-        print("Computing Edge Weights")
-        res = []
-        for idx in section:
-            for vertex in range(self.data.shape[0]):
-                if vertex != idx:
-                    res.append((idx, vertex, self.similarity_function(idx, vertex, gamma)))
-        print("Completed Edge Weights Computation")
-        return res
-
-    def optimized_edge_weight_update(self, edge_weight_res, curr_sim_matr):
-        """Update the sparse matrix with new edge weights."""
-        print("Updating Edge Weights")
-        row_indices = []
-        col_indices = []
-        values = []
-
-        for section in edge_weight_res:
-            for weight in section:
-                idx1, idx2, w = weight
-                if idx1 != idx2:  # Avoid self-loops early
-                    row_indices.append(idx1)
-                    col_indices.append(idx2)
-                    values.append(w)
-                    row_indices.append(idx2)
-                    col_indices.append(idx1)
-                    values.append(w)
-
-        # Create a sparse matrix from the collected values
-        row_indices = cp.array(row_indices)
-        col_indices = cp.array(col_indices)
-        values = cp.array(values)
-
-        # Create a sparse matrix and perform the update on GPU
-        new_sim_matr = csr_matrix((values, (row_indices, col_indices)), shape=curr_sim_matr.shape)
-        curr_sim_matr += new_sim_matr
-        print("Edge Weights Updated")
-        return curr_sim_matr
-
     def generate_edge_weights(self, gamma):
         print("Generating Edge Weights")
         curr_sim_matr = csr_matrix(np.zeros_like(self.similarity_matrix.toarray()))
 
-        # Remove multiprocessing; now iterating sequentially
+        # Removed parallelization; iterating sequentially over sections
         split_data = self.split(range(self.data.shape[0]), cpu_count())
 
         edge_weight_res = []
@@ -189,5 +188,18 @@ class AEW:
             adj_matrix.setdiag(identity_diag_res)
             return csr_matrix(cp.identity(adj_matrix.shape[0])) - adj_matrix
         else:
-            identity_diag_res = cp.ones(len(adj_matrix))
+            identity_diag_res = cp.ones(len(adj_matrix)) + 2
+            np.fill_diagonal(adj_matrix, identity_diag_res)
+            return np.identity(len(adj_matrix)) - adj_matrix
 
+def collect_non_zero_entries(section):
+    """Collect non-zero entries from a section of the edge weight results."""
+    cp.cuda.Device(0).use()
+    row_indices = []
+    col_indices = []
+    values = []
+    for idx1, idx2 in zip(*cp.where(section != 0)):  # Find non-zero entries
+        row_indices.append(idx1)
+        col_indices.append(idx2)
+        values.append(section[idx1, idx2])
+    return row_indices, col_indices, values

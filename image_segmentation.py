@@ -1,4 +1,4 @@
-from aew_gpu_2 import *
+from aew_gpu_3 import *
 from label_propagation import *
 
 import pandas as pd
@@ -105,6 +105,8 @@ def segment_image(image, num_seeds=5, max_iter=100, sigma=1.0):
     # Step 4: Perform label propagation
     label_propagator = LabelPropagation(adjacency_matrix, labels, max_iter=max_iter)
     propagated_labels = label_propagator.propagate_labels()
+
+    propagated_labels = propagated_labels.get()
 
     # Reshape the propagated labels back to the image dimensions
     height, width, _ = image.shape
