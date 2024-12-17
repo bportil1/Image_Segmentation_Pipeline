@@ -14,30 +14,49 @@ from sklearn.decomposition import PCA
 from sklearn.pipeline import make_pipeline
 from time import time
 from sklearn.neighbors import kneighbors_graph
+from sklearn.neighbors import NearestNeighbors
+from sklearn.model_selection import StratifiedShuffleSplit
+from scipy.sparse import csr_matrix
 import plotly.express as px
-
 from sklearn.compose import ColumnTransformer
 
 import os
 
-class data():
-    def __init__(self, data = None, labels = None, datapath= None):
-        self.data = data
+import faiss
+
+class data:
+    '''
+    Class to hold and call preprocessing functions for the chosen dataset
+    '''
+    def __init__(self, path, graph_type='whole'):
+        self.datapath = path
+        self.data = self.load_data(500)
+        self.data, self.labels = self.load_labels()
+        self.class_labels = {'class': {'normal':0, 'anomaly':1}}
+        if graph_type == 'stratified':
+            self.stratified_data, self.stratified_labels = self.stratified_data(.95, 25)
         self.graph = None
-        self.labels = labels
-        self.datapath = datapath
-        self.class_labels = {'class': {'normal': 0, 'anomaly':1}}
-        self.similarity_matrix = None
+
+    def stratified_data(self, sample_size, splits):
+        '''
+        Function to stratify data
+        '''
+        stratified_split = StratifiedShuffleSplit(n_splits=splits, test_size=sample_size)
+        indices =  stratified_split.split(self.data, self.labels)     
+        strat_data = []
+        strat_labels = []
+        for idx, (train, test) in enumerate(indices):
+            strat_data.append(self.data.iloc[train])
+            strat_labels.append(self.labels.iloc[train])
+            strat_data[idx] = strat_data[idx].reset_index(drop=True)
+            strat_labels[idx] = strat_labels[idx].reset_index(drop=True)
+        return strat_data, strat_labels
 
     def scale_data(self, scaling):
-        cols = self.data.loc[:, ~self.data.columns.isin(['flag',
-                                                                     'land', 'wrong_fragment', 'urgent',
-                                                                     'num_failed_logins', 'logged_in',
-                                                                     'root_shell', 'su_attempted', 'num_shells',
-                                                                     'num_access_files', 'num_outbound_cmds',
-                                                                     'is_host_login', 'is_guest_login', 'serror_rate',                                                                     'srv_serror_rate', 'rerror_rate', 'srv_rerror_rate',                                                                  'same_srv_rate', 'diff_srv_rate',
-                                                                     'srv_diff_host_rate', 'dst_host_same_srv_rate',
-                                                                     'dst_host_diff_srv_rate', 'dst_host_same_src_port_rate',                                                              'dst_host_srv_diff_host_rate', 'dst_host_serror_rate',                                                                'dst_host_srv_serror_rate', 'dst_host_rerror_rate',                                                                   'dst_host_srv_rerror_rate', 'protocol_type ', 'service ' ])].columns
+        '''
+        Function to scale the data
+        '''
+        cols = self.data.columns
         cols = np.asarray(cols)
         if scaling == 'standard':
             ct = ColumnTransformer([('normalize', StandardScaler(), cols)],
@@ -46,7 +65,6 @@ class data():
             
             transformed_cols = ct.fit_transform(self.data)
             self.data = pd.DataFrame(transformed_cols, columns = self.data.columns)
-
         elif scaling == 'min_max':
             ct = ColumnTransformer([('normalize', MinMaxScaler(), cols)],
                                     remainder='passthrough'  
@@ -54,7 +72,6 @@ class data():
 
             transformed_cols = ct.fit_transform(self.data)
             self.data = pd.DataFrame(transformed_cols, columns = self.data.columns)
-
         elif scaling == 'robust':
             ct = ColumnTransformer([('scaler', RobustScaler(), cols)],
                                     remainder='passthrough'
@@ -62,45 +79,96 @@ class data():
             transformed_cols = ct.fit_transform(self.data)
             self.data = pd.DataFrame(transformed_cols, columns = self.data.columns)
         else:
-            print("Scaling arg not supported")
+            raise ValueError("Scaling arg not supported")
         
     def encode_categorical(self, column_name, target_set):
+        '''
+        Function to encode categorical data or labels
+        '''        
         label_encoder = LabelEncoder()
 
         if target_set == 'data': 
             label_encoder = label_encoder.fit(self.data[column_name])
             self.data[column_name] = label_encoder.transform(self.data[column_name])
         elif target_set == 'labels':
+            #print(self.labels)
             self.labels = self.labels.replace(self.class_labels)
 
     def load_data(self, sample_size=None):
-        self.data = pd.read_csv(self.datapath)
+        '''
+        Function to load data
+        '''        
+        data = pd.read_csv(self.datapath)
         if sample_size != None:
-            self.data = self.data.sample(sample_size)
-    
+            return data.sample(sample_size)
+        else:
+            return data
+
     def load_labels(self):
-        self.labels = pd.DataFrame(self.data['class'], columns=['class'])
-        self.data = self.data.loc[:, self.data.columns != 'class']
-        self.reset_indices()
+        '''
+        Function to load labels
+        '''
+        labels = pd.DataFrame(self.data['class'], columns=['class'])
+        data = self.data.loc[:, self.data.columns != 'class']
+        return self.reset_indices(data, labels)
 
-    def reset_indices(self):
-        self.data = self.data.reset_index(drop=True)
-        self.labels = self.labels.reset_index(drop=True)
+    def reset_indices(self, data, labels):
+        '''
+        Function to reset indices from zero to the max number of rows
+        '''
+        data = data.reset_index(drop=True)
+        labels = labels.reset_index(drop=True)
+        return data, labels
 
-    def generate_graphs(self, num_neighbors, mode='distance', metric='euclidean'):
-        self.graph = kneighbors_graph(self.data, n_neighbors=num_neighbors, mode=mode, metric=metric, p=2, include_self=True, n_jobs=-1)
+    def generate_graphs(self, num_neighbors, rep=None, mode='distance', data_type='whole'):
+        '''
+        Function to initialize the adjacency matrix
+        '''
+        if data_type == 'whole':
+            data_matrix = np.array(self.data, dtype=np.float32)
+            x_len = self.data.shape[0]
+            y_len = self.data.shape[0]
+        elif data_type == 'stratified':
+            data_matrix = np.array(self.stratified_data[rep], dtype=np.float32)
+            x_len = self.stratified_data[rep].shape[0]
+            y_len = self.stratified_data[rep].shape[0]
+        index = faiss.IndexFlatL2(data_matrix.shape[1])
+        index.add(data_matrix)
+        distances, indices = index.search(data_matrix, num_neighbors) 
+        if mode == 'distance':
+            graph_data = np.zeros((x_len, y_len))
+            for i in range(len(indices)):
+                for j in range(num_neighbors):
+                    graph_data[i, indices[i, j]] = distances[i, j]
+        elif mode == 'connectivity':
+            graph_data = np.zeros((x_len, y_len))
+            for i in range(len(indices)):
+                for j in range(num_neighbors):
+                    graph_data[i, indices[i, j]] = 1
+        else:
+            raise ValueError("'distance' or 'connectivity' only")
+        graph = csr_matrix(graph_data)
+        #mm_file = './mmap_file'
+        #graph = np.memmap(mm_file + 'knn_graph', dtype='float32', mode='w+', shape=graph.shape)
+        self.graph = graph
+        #return graph
 
 class visualizer():
+    '''
+    Class with visualization utilities
+    '''
     def __init__(self, labels, dims):
 
         if isinstance(labels, np.ndarray):
             self.labels = pd.DataFrame(labels, columns=['class'])
         elif isinstance(labels, pd.DataFrame):
             self.labels = labels
-
         self.dims = dims
 
     def get_embeddings(self, num_components, embedding_subset = None):
+        '''
+        Function to collect implemented lower dimensional mappings
+        '''            
         embeddings = {
             #"Truncated SVD embedding": TruncatedSVD(n_components=num_components),
             #"Standard LLE embedding": LocallyLinearEmbedding(
@@ -130,6 +198,9 @@ class visualizer():
             return out_dict
 
     def downsize_data(self, data):
+        '''
+        Function to cast data to lower dimensions
+        '''
         embeddings = self.get_embeddings(self.dims)
 
         projections, timing = {}, {}
@@ -142,6 +213,9 @@ class visualizer():
         return projections, timing 
 
     def lower_dimensional_embedding(self, data, title, path, downsize=False):
+        '''
+        Plotting utility calling function
+        '''        
         embeddings = self.get_embeddings(self.dims)
         if downsize:
             projections, timing = self.downsize_data(data) 
@@ -155,6 +229,9 @@ class visualizer():
 
 
     def plot_embedding(self, data, title, path):
+        '''
+        Plotting utility caller
+        '''
         cdict = { 0: 'blue', 1: 'red'}
 
         #print(data)
@@ -165,9 +242,12 @@ class visualizer():
             self.plot_3d(data, title, path, cdict)
         
     def plot_2d(self, data, title, path, cdict):
+        '''
+        2-D plotting function
+        '''
         df = pd.DataFrame({ 'x1': data[:,0],
                             'x2': data[:,1],
-                            'label': np.asarray(self.labels['class']) })
+                            'label': np.asarray(self.labels['defects']) })
 
         for label in np.unique(self.labels):
             idx = np.where(self.labels == label)
@@ -184,10 +264,13 @@ class visualizer():
         fig.write_html(file_name, div_id = title)
 
     def plot_3d(self, data, title, path, cdict):
+        '''
+        3-D plotting function
+        '''        
         df = pd.DataFrame({ 'x1': data[:,0],
                             'x2': data[:,1],
                             'x3': data[:,2],
-                            'label': np.asarray(self.labels['class'])})
+                            'label': np.asarray(self.labels['defects'])})
 
         for label in np.unique(self.labels):
             idx = np.where(self.labels == label)

@@ -135,6 +135,6 @@ def visualize_segmentation(image, segmented_image):
     plt.show()
 
 if __name__ == "__main__":
-    image =  cv2.imread('80_12.png')
+    image =  cv2.imread('366_6.png')
     segmented_image = segment_image(image)
     visualize_segmentation(image, segmented_image)
